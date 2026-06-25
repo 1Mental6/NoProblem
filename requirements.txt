@@ -1,0 +1,33 @@
+# Runtime dependencies — pinned to the versions this build was verified with.
+# These are the ONLY packages the core text-parsing GUI actually imports; their
+# sub-dependencies (Pillow, pypdfium2, charset-normalizer, cryptography, ...)
+# are pulled in automatically by pip.
+#
+# PyInstaller is NOT listed here — it is a build-only tool installed separately
+# (see README.md "Build from source").
+
+PyQt6==6.10.0                 # desktop GUI (main.py)
+pdfplumber==0.11.9            # PDF text/word extraction (extractor.py)
+pdfminer.six==20251230        # pdfplumber's text engine (imported as `pdfminer`)
+python-dateutil==2.9.0.post0  # flexible date parsing (normalizer.py, `dateutil`)
+rapidfuzz==3.14.5             # fuzzy header matching (normalizer.py)
+openpyxl==3.1.5               # .xlsx writing (exporter.py)
+
+# ----------------------------------------------------------------------------
+# OPTIONAL — scanned / image-only PDF support (OCR + ruled-table extraction).
+# Not installed by default and intentionally EXCLUDED from the packaged .exe to
+# keep it lean. Uncomment these AND remove the matching names from `excludes`
+# in build.spec to bundle them.
+#
+#   camelot-py[cv]>=0.11      # lattice/stream table extraction (needs Ghostscript)
+#   pytesseract>=0.3.10       # OCR wrapper            -> needs external Tesseract-OCR
+#   pdf2image>=1.17           # rasterises PDF for OCR -> needs external Poppler
+#
+# External (non-pip) programs these need, installed separately:
+#   * Tesseract-OCR -> https://github.com/UB-Mannheim/tesseract/wiki
+#   * Poppler       -> https://github.com/oschwartz10612/poppler-windows/releases
+#   * Ghostscript   -> https://ghostscript.com/releases/gsdnld.html
+# Point the tool at them (if not on PATH) via:
+#   TESSERACT_CMD = full path to tesseract.exe
+#   POPPLER_PATH  = folder containing pdftoppm.exe / pdfinfo.exe
+# ----------------------------------------------------------------------------
