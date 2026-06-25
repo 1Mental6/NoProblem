@@ -20,6 +20,7 @@ failed and the run continues with the rest. Nothing crashes silently.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import traceback
 from typing import Dict, List, Optional, Tuple
@@ -420,10 +421,49 @@ def run_selftest(pdf_path: str) -> int:
 
     expect("transactions extracted (not zero)", len(txns) > 0)
 
+    # Pick the acceptance set by detecting which statement format this is, so the
+    # SAME --selftest command works for the dash-delimited SBI statement and the
+    # original no-dash Indian Bank statement with no manual switch.
+    fmt = _detect_statement_format(txns)
+    print(f"Detected format: {fmt}\n")
+    if fmt == "hdfc":
+        _selftest_hdfc(txns, result, summary, expect)
+    elif fmt == "sbi":
+        _selftest_sbi(txns, result, summary, expect)
+    elif fmt == "indian-bank":
+        _selftest_indian_bank(txns, result, summary, expect)
+    else:
+        # Unknown statement: fall back to the format-agnostic baseline.
+        expect("all balances validate OK", summary["checks"] == 0)
+
+    print("-" * 70)
+    print(f"VERDICT: extracted {len(txns)} transaction(s); "
+          f"{'ALL CHECKS PASSED' if not failures else f'{len(failures)} CHECK(S) FAILED: ' + str(failures)}")
+    return 0 if not failures else 1
+
+
+def _detect_statement_format(txns: list) -> str:
+    """Classify the parsed statement so the right acceptance set runs."""
+    for t in txns:
+        p = t.get("particulars") or ""
+        if "FUND/HDFC BANK/0001NEFT" in p or "Account Closure Proceeds to DD Acct" in p:
+            return "hdfc"
+    for t in txns:
+        if "CDM4040109MAL BAZAR" in (t.get("particulars") or ""):
+            return "sbi"
+    for t in txns:
+        d = t.get("date")
+        if d and d.strftime("%d/%m/%y") == "01/04/25":
+            return "indian-bank"
+    return "generic"
+
+
+def _selftest_indian_bank(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the no-dash Indian Bank statement (unchanged)."""
     # The 01/04/25 transaction (first after Brought Forward).
     first = next((t for t in txns if t.get("date") and t["date"].strftime("%d/%m/%y") == "01/04/25"), None)
     if first is not None:
-        print(f"\n01/04/25 -> Debit={first['debit']} Credit={first['credit']} "
+        print(f"01/04/25 -> Debit={first['debit']} Credit={first['credit']} "
               f"Balance={first['balance']} [{first.get('validation')}]")
         print(f"Particulars: {first['particulars']!r}\n")
         expect("01/04/25 Credit == 8050.00", (first["credit"] or 0) == 8050.00)
@@ -444,10 +484,113 @@ def run_selftest(pdf_path: str) -> int:
            not any("carried forward" in (t.get("particulars") or "").lower() for t in txns))
     expect("all balances validate OK", summary["checks"] == 0)
 
-    print("-" * 70)
-    print(f"VERDICT: extracted {len(txns)} transaction(s); "
-          f"{'ALL CHECKS PASSED' if not failures else f'{len(failures)} CHECK(S) FAILED: ' + str(failures)}")
-    return 0 if not failures else 1
+
+def _selftest_sbi(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the dash-delimited SBI statement.
+
+    Confirms the positional Ref/Debit/Credit/Balance mapping (credits and debits
+    land in the right column), running-balance reconciliation, the value-date-first
+    column order, and that wrapped descriptions read in order without bleeding into
+    the neighbouring transaction.
+    """
+    def find(needle):
+        return next((t for t in txns if needle in (t.get("particulars") or "")), None)
+
+    # CDM cash deposit: the 25,000.00 credit must land in Credit, not Debit.
+    cdm = find("CDM4040109MAL BAZAR")
+    if cdm is not None:
+        print(f"CDM CSH DEP -> Debit={cdm['debit']} Credit={cdm['credit']} "
+              f"Balance={cdm['balance']} [{cdm.get('validation')}]")
+        print(f"Particulars: {cdm['particulars']!r}\n")
+        expect("CDM 25,000.00 lands in Credit (not Debit)",
+               (cdm["credit"] or 0) == 25000.00 and not cdm["debit"])
+        expect("CDM balance == 26,606.06", abs((cdm["balance"] or 0) - 26606.06) < 0.01)
+        expect("CDM particulars read in order",
+               (cdm["particulars"] or "").startswith("CSH DEP (CDM) CDM4040109MAL BAZAR"))
+        expect("CDM does not bleed neighbour text ('RURAL DEVEP')",
+               "RURAL DEVEP" not in (cdm["particulars"] or ""))
+    else:
+        expect("CDM transaction found", False)
+
+    # WDL transfer: the 20,000.00 must land in Debit, not Credit.
+    wdl = find("WDL TFR J 0032035033755 OF Mr. JOY GHOSH")
+    if wdl is not None:
+        print(f"WDL TFR -> Debit={wdl['debit']} Credit={wdl['credit']} "
+              f"Balance={wdl['balance']} [{wdl.get('validation')}]")
+        print(f"Particulars: {wdl['particulars']!r}\n")
+        expect("WDL 20,000.00 lands in Debit (not Credit)",
+               (wdl["debit"] or 0) == 20000.00 and not wdl["credit"])
+        expect("WDL balance == 6,606.06", abs((wdl["balance"] or 0) - 6606.06) < 0.01)
+    else:
+        expect("WDL 20,000 transaction found", False)
+
+    # Value-date-first column order: both dates captured, neither lost to the
+    # description, and the value date is not swapped away.
+    expect("value_date captured on every dated row (value-date-first)",
+           all(t.get("value_date") is not None for t in txns))
+    expect("dates not bled into particulars",
+           not any(re.match(r"^\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", t.get("particulars") or "")
+                   for t in txns))
+
+    # Positional debit/credit (never a both-columns-populated row) and reconciliation.
+    expect("no row has both debit and credit populated",
+           not any(t.get("debit") and t.get("credit") for t in txns))
+    expect("balances reconcile (0 rows flagged CHECK)", summary["checks"] == 0)
+
+
+def _selftest_hdfc(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the single-amount + CR/DR HDFC/Axis statement.
+
+    Confirms the CR/DR indicator routes the amount to the right column, that the
+    split NEFT rows are reassembled across physical lines, that the garbled
+    TRANSACTION TOTAL footer is skipped, and that the balances reconcile.
+    """
+    def find(needle):
+        return next((t for t in txns if needle in (t.get("particulars") or "")), None)
+
+    # Single-line debit (raw line 46): Monthly Service Chrgs 100.00 DR ... 23,28,470.10.
+    svc = next((t for t in txns
+                if abs((t.get("balance") or -1) - 2328470.10) < 0.01), None)
+    if svc is not None:
+        print(f"Svc Chrgs -> Debit={svc['debit']} Credit={svc['credit']} "
+              f"Balance={svc['balance']} [{svc.get('validation')}]")
+        print(f"Particulars: {svc['particulars']!r}\n")
+        expect("Service Chrgs 100.00 lands in Debit (not Credit)",
+               (svc["debit"] or 0) == 100.00 and not svc["credit"])
+        expect("Service Chrgs balance == 23,28,470.10", abs((svc["balance"] or 0) - 2328470.10) < 0.01)
+        expect("Service Chrgs description (branch/SOL code stripped)",
+               svc["particulars"] == "Monthly Service Chrgs")
+    else:
+        expect("Monthly Service Chrgs (balance 23,28,470.10) found", False)
+
+    # Split NEFT row (raw lines 43/44): amount on a separate physical line.
+    neft = find("NEFT/HDFCH00458832942")
+    if neft is not None:
+        print(f"NEFT split -> Debit={neft['debit']} Credit={neft['credit']} "
+              f"Balance={neft['balance']} [{neft.get('validation')}]")
+        print(f"Particulars: {neft['particulars']!r}\n")
+        expect("NEFT 25,500.00 lands in Credit (not Debit)",
+               (neft["credit"] or 0) == 25500.00 and not neft["debit"])
+        expect("NEFT balance == 23,28,570.10", abs((neft["balance"] or 0) - 2328570.10) < 0.01)
+        expect("NEFT split description assembled across lines in order",
+               neft["particulars"] ==
+               "NEFT/HDFCH00458832942/SBI MUTUAL FUND/HDFC BANK/0001NEFT 00600350000549")
+    else:
+        expect("split NEFT transaction found", False)
+
+    expect("opening balance 12,07,458.10 captured",
+           result["opening_balance"] is not None and abs(result["opening_balance"] - 1207458.10) < 0.01)
+    expect("TRANSACTION TOTAL footer row skipped (not a transaction)",
+           not any("TRANSACTION TOTAL" in (t.get("particulars") or "").upper() for t in txns))
+    # The trailing branch/SOL code ("SILIGURI [WB] (035)") sits after the balance
+    # and must be gone -- identified by its "[WB]" state marker and trailing
+    # "(NNN)" code, not by the town name, which also appears mid-description
+    # (e.g. "ATM-CASH/SILIGURI/SILIGURI/240525").
+    expect("branch/SOL codes stripped from every particulars",
+           not any(re.search(r"\[WB\]|\(\d{3}\)\s*$", t.get("particulars") or "") for t in txns))
+    expect("no row has both debit and credit populated",
+           not any(t.get("debit") and t.get("credit") for t in txns))
+    expect("balances reconcile (0 rows flagged CHECK)", summary["checks"] == 0)
 
 
 def main() -> int:
