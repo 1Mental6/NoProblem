@@ -63,8 +63,13 @@ def export_to_excel(
     opening_balance: Optional[float] = None,
     ocr_used: bool = False,
     debug_pages: Optional[Sequence[Tuple[int, Sequence[str]]]] = None,
+    unrecognized: bool = False,
 ) -> str:
-    """Write *transactions* (+ optional debug dump) to *output_path*."""
+    """Write *transactions* (+ optional debug dump) to *output_path*.
+
+    *unrecognized* writes a prominent banner warning that the bank format was not
+    recognised and the rows were parsed with the best-effort generic parser.
+    """
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -74,7 +79,7 @@ def export_to_excel(
     last_ws = None
     for i, chunk in enumerate(chunks, start=1):
         title = f"Transactions {i}" if multi else "Transactions"
-        last_ws = _write_sheet(wb, title, chunk, ocr_used)
+        last_ws = _write_sheet(wb, title, chunk, ocr_used, unrecognized)
 
     _write_summary(last_ws, transactions, opening_balance)
     _write_debug_sheet(wb, debug_pages or [])
@@ -86,16 +91,15 @@ def export_to_excel(
 # ---------------------------------------------------------------------------
 # Transactions sheet
 # ---------------------------------------------------------------------------
-def _write_sheet(wb: Workbook, title: str, transactions: List[dict], ocr_used: bool):
+def _write_sheet(wb: Workbook, title: str, transactions: List[dict],
+                 ocr_used: bool, unrecognized: bool = False):
     ws = wb.create_sheet(title=title)
     row_cursor = 1
 
-    if ocr_used:
-        note = ("⚠ Some pages were read with OCR (scanned PDF). "
-                "Please review the extracted figures manually.")
-        ws.cell(row=1, column=1, value=note).font = Font(bold=True, color="C00000")
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(HEADERS))
-        row_cursor = 2
+    for note in _banners(ocr_used, unrecognized):
+        ws.cell(row=row_cursor, column=1, value=note).font = Font(bold=True, color="C00000")
+        ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=len(HEADERS))
+        row_cursor += 1
 
     header_row = row_cursor
     for col, name in enumerate(HEADERS, start=1):
@@ -120,6 +124,18 @@ def _write_sheet(wb: Workbook, title: str, transactions: List[dict], ocr_used: b
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
     _autofit(ws, header_row)
     return ws
+
+
+def _banners(ocr_used: bool, unrecognized: bool) -> List[str]:
+    """Warning lines to show above the header (most severe first)."""
+    notes = []
+    if unrecognized:
+        notes.append("⚠ Bank format NOT recognised — parsed with a best-effort generic "
+                     "parser. Review every row carefully before relying on this data.")
+    if ocr_used:
+        notes.append("⚠ Some pages were read with OCR (scanned PDF). "
+                     "Please review the extracted figures manually.")
+    return notes
 
 
 def _write_summary(ws, transactions: List[dict], opening_balance: Optional[float]) -> None:

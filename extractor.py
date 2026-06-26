@@ -78,6 +78,62 @@ class ExtractionError(Exception):
     """Raised when a PDF cannot be opened / read at all."""
 
 
+class PasswordError(ExtractionError):
+    """Raised when a PDF is encrypted and needs a (correct) password.
+
+    The caller can catch this specifically to prompt the user for a password
+    rather than treating it as a generic, unrecoverable extraction failure.
+    """
+
+
+def _is_password_error(exc: BaseException) -> bool:
+    """Whether *exc* (or anything it wraps) means 'this PDF needs a password'.
+
+    pdfplumber re-raises pdfminer's ``PDFPasswordIncorrect`` wrapped inside a
+    ``PdfminerException`` whose own message is empty, with the real cause tucked
+    into ``__context__`` / ``args``. So we walk the whole exception chain rather
+    than just inspecting the top-level type and message.
+    """
+    seen: set = set()
+    stack: List[Optional[BaseException]] = [exc]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        blob = f"{type(e).__name__} {e}".lower()
+        if "password" in blob or "encrypt" in blob:
+            return True
+        stack.append(getattr(e, "__cause__", None))
+        stack.append(getattr(e, "__context__", None))
+        for arg in getattr(e, "args", ()):
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+    return False
+
+
+def requires_password(pdf_path: str) -> bool:
+    """True if the PDF is encrypted and cannot be opened without a password.
+
+    PDFs that are encrypted but openable with an empty user password (owner-only
+    protection) return False -- they need no prompt.
+    """
+    try:
+        with pdfplumber.open(pdf_path):
+            return False
+    except Exception as exc:  # noqa: BLE001
+        return _is_password_error(exc)
+
+
+def password_is_correct(pdf_path: str, password: str) -> bool:
+    """True if *password* successfully decrypts the PDF. Never logs the value."""
+    try:
+        with pdfplumber.open(pdf_path, password=password or ""):
+            return True
+    except Exception:  # noqa: BLE001 - wrong password (or other open failure)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -85,11 +141,21 @@ def extract_pages(
     pdf_path: str,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    password: str = "",
 ) -> Iterator[PageData]:
-    """Yield :class:`PageData` for every page of *pdf_path*, one at a time."""
+    """Yield :class:`PageData` for every page of *pdf_path*, one at a time.
+
+    *password* is forwarded to pdfplumber for encrypted PDFs and is never stored
+    or logged. An encrypted PDF opened with a missing/incorrect password raises
+    :class:`PasswordError` so the caller can re-prompt.
+    """
     try:
-        pdf = pdfplumber.open(pdf_path)
+        pdf = pdfplumber.open(pdf_path, password=password or "")
     except Exception as exc:  # noqa: BLE001 - surface a clean message upstream
+        if _is_password_error(exc):
+            raise PasswordError(
+                "PDF is encrypted and the password is missing or incorrect."
+            ) from exc
         raise ExtractionError(f"Could not open PDF: {exc}") from exc
 
     try:

@@ -161,6 +161,19 @@ def pline_from_words(words: list) -> PLine:
     return PLine(text, top, ordered)
 
 
+def page_to_plines(page) -> List[PLine]:
+    """Convert one extractor ``PageData`` into positioned lines for the parser.
+
+    Coordinate words become geometry-aware ``PLine``s; OCR / plain-text pages get
+    a synthetic ``top`` from their reading order so vertical-order logic still works.
+    """
+    if page.lines:                                   # coordinate words available
+        return [pline_from_words(line) for line in page.lines if line]
+    if page.text_lines:                              # OCR / plain text: synth y = index
+        return [PLine(t, float(i)) for i, t in enumerate(page.text_lines) if t.strip()]
+    return []
+
+
 def _last_money(text: str) -> Optional[float]:
     matches = list(_MONEY_TOKEN_RE.finditer(text))
     if not matches:
@@ -176,12 +189,20 @@ def _has_money(text: str) -> bool:
 class LineStatementParser:
     """Streaming, page-by-page parser. Feed pages in order; collect at the end."""
 
-    def __init__(self, opening_balance: Optional[float] = None) -> None:
+    def __init__(self, opening_balance: Optional[float] = None,
+                 force_format: Optional[str] = None) -> None:
         self.transactions: List[dict] = []
         self.opening_balance = opening_balance
         self.closing_balance: Optional[float] = None
         self.prev_balance = opening_balance
         self.detected_format: Optional[str] = None   # locked once a page is classified
+        # When a caller already knows the format (a specific bank was chosen) it
+        # can pin the path and skip per-page auto-detection:
+        #   "hdfc" -> single-amount + CR|DR path
+        #   "line" -> the SBI-dash / Indian-Bank line path (dash vs no-dash still
+        #             auto-resolves per line within that path)
+        #   None   -> auto-detect (default; original behaviour)
+        self.force_format = force_format
 
     # -- public ------------------------------------------------------------
     def feed_page(self, plines: List[PLine]) -> None:
@@ -192,7 +213,10 @@ class LineStatementParser:
         # (split money lines, S.NO anchors), so it gets its own path. Detection is
         # sticky: once a statement shows the "<amount> <CR|DR> <balance>" signature
         # every later page (closing balance, disclaimers) stays on that path too.
-        if self.detected_format == "hdfc" or self._is_hdfc_page(plines):
+        use_hdfc = self.force_format == "hdfc" or (
+            self.force_format is None
+            and (self.detected_format == "hdfc" or self._is_hdfc_page(plines)))
+        if use_hdfc:
             self.detected_format = "hdfc"
             self._feed_page_hdfc(plines)
             return

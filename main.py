@@ -28,12 +28,14 @@ from typing import Dict, List, Optional, Tuple
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import exporter
+import extractor
+from bank_parsers import BANK_CHOICES
 from pipeline import parse_pdf
 
 PREVIEW_CAP = 500          # max rows shown in the on-screen table
@@ -50,9 +52,13 @@ class ParseWorker(QThread):
     file_failed = pyqtSignal(str, str)
     all_done = pyqtSignal()
 
-    def __init__(self, pdf_paths: List[str]) -> None:
+    def __init__(self, pdf_paths: List[str], bank: str = "auto",
+                 passwords: Optional[Dict[str, str]] = None) -> None:
         super().__init__()
         self.pdf_paths = pdf_paths
+        self.bank = bank
+        # In-memory only: passwords are used for this run and never persisted/logged.
+        self._passwords = passwords or {}
         self._cancel = False
 
     def cancel(self) -> None:
@@ -79,6 +85,8 @@ class ParseWorker(QThread):
             cancel_check=lambda: self._cancel,
             collect_debug=True,
             debug_line_cap=DEBUG_LINE_CAP,
+            password=self._passwords.get(path, ""),
+            bank=self.bank,
         )
 
 
@@ -115,6 +123,15 @@ class MainWindow(QMainWindow):
         for b in (self.btn_select, self.btn_clear, self.btn_parse, self.btn_export):
             top.addWidget(b)
         top.addStretch(1)
+        top.addWidget(QLabel("Select your bank:"))
+        self.bank_combo = QComboBox()
+        for key, label in BANK_CHOICES:
+            self.bank_combo.addItem(label, key)   # userData = bank key
+        self.bank_combo.setToolTip(
+            "Pick your bank to use its dedicated parser, or 'Auto-detect' to "
+            "identify the format automatically."
+        )
+        top.addWidget(self.bank_combo)
         root.addLayout(top)
 
         root.addWidget(QLabel("Selected PDFs:"))
@@ -174,6 +191,14 @@ class MainWindow(QMainWindow):
     def start_parsing(self) -> None:
         if not self.pdf_paths:
             return
+
+        # Collect passwords for any encrypted PDFs up front, on the GUI thread.
+        # Files that stay locked (cancelled / 3 wrong tries) are skipped.
+        paths, passwords = self._collect_passwords(self.pdf_paths)
+        if not paths:
+            self.status.setText("No PDFs to parse (all locked were skipped).")
+            return
+
         self.results.clear()
         self.preview_combo.clear()
         self.table.setRowCount(0)
@@ -181,13 +206,56 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
 
-        self.worker = ParseWorker(list(self.pdf_paths))
+        bank = self.bank_combo.currentData() or "auto"
+        self.worker = ParseWorker(paths, bank=bank, passwords=passwords)
         self.worker.progress.connect(self._on_progress)
         self.worker.file_started.connect(self._on_file_started)
         self.worker.file_done.connect(self._on_file_done)
         self.worker.file_failed.connect(self._on_file_failed)
         self.worker.all_done.connect(self._on_all_done)
         self.worker.start()
+
+    def _collect_passwords(self, paths: List[str]) -> Tuple[List[str], Dict[str, str]]:
+        """Return (parseable_paths, {path: password}) for encrypted PDFs.
+
+        Passwords are held only for this run and are never written to disk or logged.
+        """
+        parseable: List[str] = []
+        passwords: Dict[str, str] = {}
+        for path in paths:
+            try:
+                needs = extractor.requires_password(path)
+            except Exception:  # noqa: BLE001 - if probing fails, let parsing report it
+                parseable.append(path)
+                continue
+            if not needs:
+                parseable.append(path)
+                continue
+            pw = self._ask_password(path)
+            if pw is None:
+                continue                       # locked -> skip this file
+            parseable.append(path)
+            passwords[path] = pw
+        return parseable, passwords
+
+    def _ask_password(self, path: str) -> Optional[str]:
+        """Prompt (masked) for this PDF's password, up to 3 attempts. None if locked."""
+        name = os.path.basename(path)
+        for attempt in range(3):
+            label = ("This PDF is password protected. Enter password:"
+                     if attempt == 0 else "Incorrect password, try again:")
+            pw, ok = QInputDialog.getText(
+                self, f"Password — {name}", label, QLineEdit.EchoMode.Password
+            )
+            if not ok:
+                return None                    # user cancelled
+            if extractor.password_is_correct(path, pw):
+                return pw
+        QMessageBox.warning(
+            self, "Password",
+            f"Could not unlock '{name}' after 3 attempts — skipping this file.",
+        )
+        return None
 
     def _on_file_started(self, path: str) -> None:
         self.status.setText(f"Parsing {os.path.basename(path)} …")
@@ -204,9 +272,11 @@ class MainWindow(QMainWindow):
         n = len(result["transactions"])
         checks = result["summary"]["checks"]
         ocr = " (OCR used — review!)" if result["ocr_used"] else ""
+        bank = result.get("bank_display", "")
+        warn = " ⚠ format NOT recognized — review!" if result.get("unrecognized") else ""
         self.status.setText(
-            f"Parsed {os.path.basename(path)}: {n} transactions, "
-            f"{checks} row(s) flagged CHECK{ocr}."
+            f"Parsed {os.path.basename(path)} [{bank}]: {n} transactions, "
+            f"{checks} row(s) flagged CHECK{ocr}.{warn}"
         )
         if self.preview_combo.count() == 1:
             self._render_preview(path)
@@ -267,8 +337,11 @@ class MainWindow(QMainWindow):
         if len(transactions) > PREVIEW_CAP:
             note = (f"  (showing first {PREVIEW_CAP} of {len(transactions)} rows — "
                     f"the full data will be exported)")
+        bank = result.get("bank_display", "")
+        warn = "  ⚠ format NOT recognized — review every row!" if result.get("unrecognized") else ""
         self.status.setText(
-            f"Previewing {os.path.basename(path)}: {len(transactions)} transactions{note}"
+            f"Previewing {os.path.basename(path)} [{bank}]: "
+            f"{len(transactions)} transactions{note}{warn}"
         )
 
     # -- export ------------------------------------------------------------
@@ -297,6 +370,7 @@ class MainWindow(QMainWindow):
                         opening_balance=result["opening_balance"],
                         ocr_used=result["ocr_used"],
                         debug_pages=result.get("debug_pages"),
+                        unrecognized=result.get("unrecognized", False),
                     )
                     successes.append((out, len(result["transactions"])))
                 except PermissionError:
@@ -391,7 +465,7 @@ def _fmt_money(value) -> str:
         return str(value)
 
 
-def run_selftest(pdf_path: str) -> int:
+def run_selftest(pdf_path: str, password: str = "", bank: str = "auto") -> int:
     """Headless parse + acceptance report for one PDF (python main.py --selftest <pdf>)."""
     import logging
     logging.basicConfig(level=logging.WARNING, format="LOG[%(levelname)s] %(message)s")
@@ -401,11 +475,17 @@ def run_selftest(pdf_path: str) -> int:
         return 1
 
     print(f"Parsing: {pdf_path}")
-    result = parse_pdf(pdf_path, collect_debug=False)
+    try:
+        result = parse_pdf(pdf_path, collect_debug=False, password=password, bank=bank)
+    except extractor.PasswordError:
+        print("This PDF is password protected. Re-run with --password \"<password>\".")
+        return 1
     txns = result["transactions"]
     summary = result["summary"]
 
     print(f"Method         : {result['method']}")
+    print(f"Bank parser    : {result.get('bank_display')} (key={result.get('bank')})"
+          f"{'  [UNRECOGNIZED — review]' if result.get('unrecognized') else ''}")
     print(f"Opening balance: {result['opening_balance']}")
     print(f"Closing balance: {result['closing_balance']}")
     print(f"Transactions   : {len(txns)}")
@@ -421,17 +501,25 @@ def run_selftest(pdf_path: str) -> int:
 
     expect("transactions extracted (not zero)", len(txns) > 0)
 
-    # Pick the acceptance set by detecting which statement format this is, so the
-    # SAME --selftest command works for the dash-delimited SBI statement and the
-    # original no-dash Indian Bank statement with no manual switch.
-    fmt = _detect_statement_format(txns)
-    print(f"Detected format: {fmt}\n")
-    if fmt == "hdfc":
-        _selftest_hdfc(txns, result, summary, expect)
-    elif fmt == "sbi":
-        _selftest_sbi(txns, result, summary, expect)
-    elif fmt == "indian-bank":
-        _selftest_indian_bank(txns, result, summary, expect)
+    # Pick the acceptance set from the bank the registry chose; fall back to a
+    # content sniff (older behaviour) when it was the generic parser. The SAME
+    # --selftest command therefore works for every supported statement.
+    fmt = result.get("bank")
+    if fmt in (None, "generic"):
+        fmt = _detect_statement_format(txns)
+    print(f"Acceptance set: {fmt}\n")
+    selftests = {
+        "bandhan": _selftest_bandhan,
+        "canara": _selftest_canara,
+        "idbi": _selftest_idbi,
+        "hdfc": _selftest_hdfc,
+        "sbi": _selftest_sbi,
+        "indian_bank": _selftest_indian_bank,
+        "indian-bank": _selftest_indian_bank,
+    }
+    runner = selftests.get(fmt)
+    if runner is not None:
+        runner(txns, result, summary, expect)
     else:
         # Unknown statement: fall back to the format-agnostic baseline.
         expect("all balances validate OK", summary["checks"] == 0)
@@ -593,13 +681,168 @@ def _selftest_hdfc(txns: list, result: dict, summary: dict, expect) -> None:
     expect("balances reconcile (0 rows flagged CHECK)", summary["checks"] == 0)
 
 
+def _selftest_bandhan(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the split-date Bandhan Bank statement.
+
+    Confirms the day-month/year halves are stitched back into full dates, that the
+    B/F line becomes the opening balance (not a transaction), that the positional
+    Debit/Credit columns route correctly, and that balances reconcile.
+    """
+    def fmt_date(d):
+        return d.strftime("%d-%b-%Y").upper() if d is not None else None
+
+    # The 02-APR cheque-paid debit: split across three physical lines.
+    chq = next((t for t in txns
+                if t.get("ref_no") == "000005" and "CHQ PAID-TP-CW" in (t.get("particulars") or "")), None)
+    if chq is not None:
+        print(f"02-APR CHQ PAID -> Debit={chq['debit']} Credit={chq['credit']} "
+              f"Balance={chq['balance']} cheque={chq['ref_no']!r} date={fmt_date(chq.get('date'))}")
+        print(f"Particulars: {chq['particulars']!r}\n")
+        expect("02-APR date rejoined to 02-APR-2025 (not '02-APR-' or '2025')",
+               fmt_date(chq.get("date")) == "02-APR-2025" and fmt_date(chq.get("value_date")) == "02-APR-2025")
+        expect("02-APR debit == 90,000.00 (positional, not credit)",
+               (chq["debit"] or 0) == 90000.00 and not chq["credit"])
+        expect("02-APR balance == 12,607.00", abs((chq["balance"] or 0) - 12607.00) < 0.01)
+        expect("02-APR cheque/ref == 000005", chq["ref_no"] == "000005")
+        expect("02-APR description assembled across split lines in order",
+               chq["particulars"] == "CHQ PAID-TP-CW GUDDU MAJHI - SILIGURI 000005")
+    else:
+        expect("02-APR CHQ PAID transaction found", False)
+
+    expect("B/F opening balance == 102,607.00 captured",
+           result["opening_balance"] is not None and abs(result["opening_balance"] - 102607.00) < 0.01)
+    expect("B/F not emitted as a transaction",
+           not any("B/F" in (t.get("particulars") or "") for t in txns))
+
+    # Every split date must have been stitched back to a full, parseable date.
+    expect("all transaction dates fully rejoined (have a year)",
+           all(t.get("date") is not None and t["date"].year >= 2000 for t in txns))
+    expect("value_date captured on every row",
+           all(t.get("value_date") is not None for t in txns))
+    expect("positional debit/credit (no row has both populated)",
+           not any(t.get("debit") and t.get("credit") for t in txns))
+    expect("balances reconcile incl. negatives (0 rows flagged CHECK)", summary["checks"] == 0)
+
+
+def _selftest_canara(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the Canara Bank statement (overdraft / negative balances).
+
+    Confirms B/F becomes the opening balance, the positional Withdraws/Deposit
+    columns route correctly, the long UPI ref lands in Cheque/Ref No, negative
+    balances are preserved, and everything reconciles.
+    """
+    expect("B/F opening balance == -3,023,185.24 captured",
+           result["opening_balance"] is not None and abs(result["opening_balance"] - (-3023185.24)) < 0.01)
+    expect("B/F not emitted as a transaction",
+           not any("B/F" in (t.get("particulars") or "") for t in txns))
+
+    # 04-APR NON-SUBMISSION debit (balance pins the exact row).
+    nonsub = next((t for t in txns if abs((t.get("balance") or 0) - (-3033185.24)) < 0.01), None)
+    if nonsub is not None:
+        print(f"04-APR NON-SUBMISSION -> Debit={nonsub['debit']} Credit={nonsub['credit']} "
+              f"Balance={nonsub['balance']}")
+        print(f"Particulars: {nonsub['particulars']!r}\n")
+        expect("04-APR debit == 10,000.00 (Withdraws, not Deposit)",
+               (nonsub["debit"] or 0) == 10000.00 and not nonsub["credit"])
+        expect("04-APR balance == -3,033,185.24 (negative preserved)",
+               abs((nonsub["balance"] or 0) - (-3033185.24)) < 0.01)
+        expect("04-APR description (no branch/ref leaked in)",
+               "NON-SUBMISSION" in (nonsub["particulars"] or "") and "6396" not in (nonsub["particulars"] or ""))
+    else:
+        expect("04-APR NON-SUBMISSION transaction found", False)
+
+    # 29-APR UPI credit with its long reference number.
+    upi = next((t for t in txns if t.get("ref_no") == "539471459250"), None)
+    if upi is not None:
+        print(f"29-APR UPI -> Debit={upi['debit']} Credit={upi['credit']} "
+              f"Balance={upi['balance']} ref={upi['ref_no']!r}")
+        print(f"Particulars: {upi['particulars']!r}\n")
+        expect("29-APR credit == 34,000.00 (Deposit, not Withdraws)",
+               (upi["credit"] or 0) == 34000.00 and not upi["debit"])
+        expect("29-APR long ref 539471459250 in Cheque/Ref No", upi["ref_no"] == "539471459250")
+        expect("29-APR balance == -2,999,185.24", abs((upi["balance"] or 0) - (-2999185.24)) < 0.01)
+        expect("29-APR multi-line UPI description assembled",
+               "UPI/CR/539471459250/" in (upi["particulars"] or "")
+               and "29/04/2025 14:04:44" in (upi["particulars"] or ""))
+    else:
+        expect("29-APR UPI transaction found", False)
+
+    expect("negative balances preserved (overdraft account)",
+           any((t.get("balance") or 0) < 0 for t in txns))
+    expect("value_date captured on every row",
+           all(t.get("value_date") is not None for t in txns))
+    expect("positional debit/credit (no row has both populated)",
+           not any(t.get("debit") and t.get("credit") for t in txns))
+    expect("balances reconcile incl. negatives (0 rows flagged CHECK)", summary["checks"] == 0)
+
+
+def _selftest_idbi(txns: list, result: dict, summary: dict, expect) -> None:
+    """Acceptance checks for the IDBI REP31 ledger (direction from balance moves).
+
+    Confirms the metadata Opening Balance is captured, that debit vs credit is
+    correctly inferred from whether the running balance fell or rose, that Tran
+    Ids land in Cheque/Ref No (and out of Particulars), and that it reconciles.
+    """
+    def by_ref(ref):
+        return next((t for t in txns if (t.get("ref_no") or "").startswith(ref)), None)
+
+    expect("Opening Balance 50,549.59 captured from metadata",
+           result["opening_balance"] is not None and abs(result["opening_balance"] - 50549.59) < 0.01)
+
+    # ANKIT BISWAS 15,000.00 -> credit (balance rose 16,554.59 -> 31,554.59).
+    ankit = by_ref("S34248905")
+    if ankit is not None:
+        print(f"ANKIT BISWAS -> Debit={ankit['debit']} Credit={ankit['credit']} "
+              f"Balance={ankit['balance']} ref={ankit['ref_no']!r}")
+        print(f"Particulars: {ankit['particulars']!r}\n")
+        expect("ANKIT BISWAS 15,000.00 is a CREDIT (balance increased)",
+               (ankit["credit"] or 0) == 15000.00 and not ankit["debit"])
+        expect("ANKIT row balance == 31,554.59", abs((ankit["balance"] or 0) - 31554.59) < 0.01)
+        expect("ANKIT Tran Id S34248905 in Cheque/Ref No",
+               "S34248905" in (ankit["ref_no"] or ""))
+        expect("ANKIT description clean (Tran Id not in Particulars)",
+               ankit["particulars"] == "UPI/102627827535/ANKIT BISWAS")
+    else:
+        expect("ANKIT BISWAS (S34248905) transaction found", False)
+
+    # VISA-POS 16,098.00 -> debit (balance fell 31,554.59 -> 15,456.59).
+    visa = by_ref("S34555947")
+    if visa is not None:
+        print(f"VISA-POS -> Debit={visa['debit']} Credit={visa['credit']} "
+              f"Balance={visa['balance']} ref={visa['ref_no']!r}")
+        print(f"Particulars: {visa['particulars']!r}\n")
+        expect("VISA-POS 16,098.00 is a DEBIT (balance decreased)",
+               (visa["debit"] or 0) == 16098.00 and not visa["credit"])
+        expect("VISA row balance == 15,456.59", abs((visa["balance"] or 0) - 15456.59) < 0.01)
+    else:
+        expect("VISA-POS (S34555947) transaction found", False)
+
+    expect("Tran Ids captured in Cheque/Ref No on every row",
+           all(t.get("ref_no") for t in txns))
+    expect("'WBIN' column artefact stays in Particulars (not an amount)",
+           any("WBIN" in (t.get("particulars") or "") for t in txns))
+    expect("balances reconcile (0 rows flagged CHECK)", summary["checks"] == 0)
+
+
+def _arg_value(flag: str) -> Optional[str]:
+    """Return the value following *flag* in argv (e.g. --password xxx), or None."""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         i = sys.argv.index("--selftest")
         if i + 1 >= len(sys.argv):
-            print('Usage: python main.py --selftest "<file.pdf>"')
+            print('Usage: python main.py --selftest "<file.pdf>" '
+                  '[--password "xxxx"] [--bank <key>]')
             return 2
-        return run_selftest(sys.argv[i + 1])
+        password = _arg_value("--password") or ""
+        bank = _arg_value("--bank") or "auto"
+        return run_selftest(sys.argv[i + 1], password=password, bank=bank)
 
     app = QApplication(sys.argv)
     window = MainWindow()
